@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import re
 from pathlib import Path
 
 import pyotp
@@ -14,6 +16,51 @@ from firstrade.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Keys whose values must never reach debug logs (compared lowercase).
+_SENSITIVE_KEYS: frozenset[str] = frozenset({
+    "ftat",
+    "sid",
+    "verificationsid",
+    "t_token",
+    "access-token",
+    "access_token",
+    "password",
+    "pin",
+    "mfacode",
+    "otpcode",
+    "cookie",
+    "set-cookie",
+})
+_SENSITIVE_SUBSTRINGS: tuple[str, ...] = ("token", "password", "secret")
+_REDACTED = "***REDACTED***"
+# Matches "key": "value" / key=value pairs for any sensitive key in raw text bodies.
+_SENSITIVE_TEXT_RE = re.compile(
+    r"""(?ix)
+    (["']?(?:ftat|sid|verificationsid|t_token|access[-_]token|password|pin|mfacode|otpcode|[a-z_-]*token|[a-z_-]*secret)["']?)
+    (\s*[:=]\s*)
+    ("[^"]*"|'[^']*'|[^\s,&;}]+)
+    """,
+)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    low = key.lower()
+    return low in _SENSITIVE_KEYS or any(sub in low for sub in _SENSITIVE_SUBSTRINGS)
+
+
+def _redact(node: object) -> object:
+    """Return a copy of a JSON-like structure with sensitive values masked."""
+    if isinstance(node, dict):
+        return {k: _REDACTED if _is_sensitive_key(str(k)) else _redact(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_redact(v) for v in node]
+    return node
+
+
+def _redact_text(text: str) -> str:
+    """Mask sensitive key/value pairs in a raw (non-JSON) body."""
+    return _SENSITIVE_TEXT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", text)
 
 
 class FTSession:
@@ -95,14 +142,14 @@ class FTSession:
         self.save_session: bool = save_session  # Flag to save session cookies
         self.debug: bool = debug
         if self.debug:
-            logging.basicConfig(level=logging.DEBUG)
-            # Enable HTTP connection debug output
-            import http.client as http_client
-
-            http_client.HTTPConnection.debuglevel = 1
-            # requests logging too
-            logging.getLogger("requests.packages.urllib3").setLevel(logging.DEBUG)
-            logging.getLogger("requests.packages.urllib3").propagate = True
+            # Only this module's logger is enabled. http.client wire debugging is
+            # deliberately NOT turned on: it prints raw request bodies (username,
+            # password, MFA codes) to stdout and cannot be redacted.
+            logger.setLevel(logging.DEBUG)
+            if not logger.handlers:
+                handler = logging.StreamHandler()
+                handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+                logger.addHandler(handler)
         self.t_token: str | None = None
         self.otp_options: str | list[dict[str, str]] | None = None
         self.login_json: dict[str, str] = {}
@@ -189,8 +236,12 @@ class FTSession:
 
     def delete_cookies(self) -> None:
         """Delete the session cookies."""
-        path: Path = Path(self.profile_path) / f"ft_cookies{self.username}.json" if self.profile_path is not None else Path(f"ft_cookies{self.username}.json")
-        path.unlink()
+        self._cookie_path().unlink()
+
+    def _cookie_path(self) -> Path:
+        """Return the exact path of this user's saved session file."""
+        directory: Path = Path(self.profile_path) if self.profile_path else Path()
+        return directory / f"ft_cookies{self.username}.json"
 
     def get_tokens(self) -> dict[str, str | bytes | dict[str, str] | None]:
         """Return the current session tokens (access_token, ftat, sid and cookies)."""
@@ -229,31 +280,30 @@ class FTSession:
             str: The saved session token.
 
         """
-        ftat = ""
-        directory: Path = Path(self.profile_path) if self.profile_path is not None else Path()
-        if not directory.exists():
-            directory.mkdir(parents=True)
-
-        for filepath in directory.iterdir():
-            if filepath.name.endswith(f"{self.username}.json"):
-                with filepath.open(mode="r") as f:
-                    ftat: str = json.load(fp=f)
-        return ftat
+        # Only the exact file written by _save_cookies is read; a suffix match
+        # would pick up unrelated *.json files (any of them when username is "").
+        path: Path = self._cookie_path()
+        if not path.is_file():
+            return ""
+        try:
+            with path.open(mode="r") as f:
+                ftat: object = json.load(fp=f)
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return ftat if isinstance(ftat, str) else ""
 
     def _save_cookies(self) -> str | None:
-        """Save session cookies to a file."""
-        # Allow providing "ftat" token from an external source
+        """Save session cookies to a file readable only by the current user."""
         if self.save_session:
-            if self.profile_path:
-                directory = Path(self.profile_path)
-                if not directory.exists():
-                    directory.mkdir(parents=True)
-                path: Path = directory / f"ft_cookies{self.username}.json"
-            else:
-                path = Path(f"ft_cookies{self.username}.json")
-            with path.open("w") as f:
+            path: Path = self._cookie_path()
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Create with 0600 so the token is never briefly world-readable, then
+            # chmod in case the file already existed with looser permissions.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 ftat: str | None = self.session.headers.get("ftat")
                 json.dump(obj=ftat, fp=f)
+            path.chmod(0o600)
 
     @staticmethod
     def _mask_email(email: str) -> str:
@@ -342,17 +392,15 @@ class FTSession:
         return self._request("post", urls.verify_pin(), data=data)
 
     def _request(self, method: str, url: str, **kwargs: object) -> requests.Response:
-        """Send HTTP request and log the full response content if debug=True."""
+        """Send HTTP request and log the response if debug=True (credentials and tokens redacted)."""
         resp = self.session.request(method, url, **kwargs)  # type: ignore[no-untyped-call]
 
         if self.debug:
-            # Suppress urllib3 / http.client debug so we only see this log
-            logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-            # Basic request info
+            # Basic request info. The request body is never logged: it carries
+            # the password, PIN and MFA codes.
             logger.debug(">>> %s %s", method.upper(), url)
             logger.debug("<<< Status: %s", resp.status_code)
-            logger.debug("<<< Headers: %s", resp.headers)
+            logger.debug("<<< Headers: %s", _redact(dict(resp.headers)))
 
             # Log raw bytes length
             try:
@@ -366,12 +414,12 @@ class FTSession:
 
                 # This automatically uses requests decompression if gzip is set
                 json_body = resp.json()
-                pretty = pyjson.dumps(json_body, indent=2)
+                pretty = pyjson.dumps(_redact(json_body), indent=2)
                 logger.debug("<<< JSON body:\n%s", pretty)
             except Exception:
                 # If JSON decoding fails, fallback to raw text
                 try:
-                    logger.debug("<<< Body (text):\n%s", resp.text)
+                    logger.debug("<<< Body (text):\n%s", _redact_text(resp.text))
                 except Exception as e2:
                     logger.debug("<<< Could not read body text: %s", e2)
 
