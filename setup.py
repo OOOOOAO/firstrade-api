@@ -6,7 +6,7 @@ long_description = pathlib.Path("README.md").read_text()
 
 setuptools.setup(
     name="firstrade",
-    version="0.0.39",
+    version="0.0.39+ooo.1",
     author="MaxxRK",
     author_email="maxxrk@pm.me",
     description="An unofficial API for Firstrade",
