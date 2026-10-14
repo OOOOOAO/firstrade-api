@@ -50,8 +50,13 @@ class OrderType(enum.StrEnum):
         SELL (str): Sell order.
         SELL_SHORT (str): Sell short order.
         BUY_TO_COVER (str): Buy to cover order.
-        BUY_OPTION (str): Buy option order.
-        SELL_OPTION (str): Sell option order.
+        BUY_OPTION (str): Buy to open option order.
+        SELL_OPTION (str): Sell to open option order.
+        SELL_TO_CLOSE (str): Sell to close option order.
+        BUY_TO_CLOSE (str): Buy to close option order (same code as BUY_TO_COVER).
+
+    Firstrade does not infer open or close from the position: closing a long
+    option needs SELL_TO_CLOSE, and SELL_OPTION always means opening a short.
 
     """
 
@@ -61,6 +66,8 @@ class OrderType(enum.StrEnum):
     BUY_TO_COVER = "BC"
     BUY_OPTION = "BO"
     SELL_OPTION = "SO"
+    SELL_TO_CLOSE = "SC"
+    BUY_TO_CLOSE = "BC"
 
 
 class OrderInstructions(enum.StrEnum):

@@ -189,7 +189,11 @@ class FTSession:
             error_msg = "Invalid JSON is your account funded?"
             raise LoginResponseError(error_msg) from exc
         if "mfa" not in self.login_json and "ftat" in self.login_json and not self.login_json["error"]:
+            # Firstrade rotates ftat on every login; keeping the old one ends device trust 30 days after the last 2FA.
+            self.session.headers["ftat"] = self.login_json["ftat"]
             self.session.headers["sid"] = self.login_json["sid"]
+            if self.save_session:
+                self._save_cookies()
             return False
         self.t_token: str | None = self.login_json.get("t_token")
         if not self.login_json.get("mfa"):
